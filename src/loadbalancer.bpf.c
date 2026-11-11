@@ -8,6 +8,8 @@
 #include <linux/icmpv6.h>
 #include <bpf/bpf_endian.h>
 #include <linux/ip.h>
+#include <linux/tcp.h>
+#include <linux/udp.h>
 
 
 /*
@@ -59,7 +61,7 @@ static __always_inline int parse_ip4hdr(struct hdr_cursor *curr, void *data_end,
     }
 
     int hdrsize = iph->ihl * 4;
-    if (hdrsize < sizeof(*iph)) {
+    if (hdrsize < (int)sizeof(*iph)) {
         return -1;
     }
     if (curr->pos + hdrsize > data_end) {
@@ -73,12 +75,51 @@ static __always_inline int parse_ip4hdr(struct hdr_cursor *curr, void *data_end,
     return iph->protocol;
 }
 
+static __always_inline int parse_tcp(struct hdr_cursor *curr, void *data_end, 
+                                     struct tcphdr **tcphdr, struct flow *packet) {
+    struct tcphdr *tcph = curr->pos;
+    if ((void *)(tcph + 1) > data_end) {
+        return -1;
+    }
+
+    int hdrsize = tcph->doff * 4;
+    if (hdrsize < (int)sizeof(*tcph)) {
+        return -1;
+    }
+    if (curr->pos + hdrsize > data_end) {
+        return -1;
+    }
+
+    curr->pos += hdrsize;
+    *tcphdr = tcph;
+    packet->src_port = tcph->source;
+    packet->dst_port = tcph->dest;
+    return 0;
+}
+
+static __always_inline int parse_udp(struct hdr_cursor *curr, void *data_end, 
+                                     struct udphdr **udphdr, struct flow *packet) {
+    struct udphdr *udph = curr->pos;
+    int hdrsize = sizeof(*udph);
+    if (curr->pos + hdrsize > data_end) {
+        return -1;
+    }
+
+    curr->pos += hdrsize;
+    *udphdr = udph;
+    packet->src_port = udph->source;
+    packet->dst_port = udph->dest;
+    return 0;
+}
+
 SEC("xdp")
 int recv_packet(struct xdp_md *ctx) {
     void *data_end = (void *)(long)ctx->data_end;
 	void *data = (void *)(long)ctx->data;
     struct ethhdr *eth;
     struct iphdr *iph;
+    struct tcphdr *tcph;
+    struct udphdr *udph;
 
     struct hdr_cursor curr;
     curr.pos = data;
@@ -94,6 +135,22 @@ int recv_packet(struct xdp_md *ctx) {
     struct flow packet = {};
     int transport_protocol;
     transport_protocol = parse_ip4hdr(&curr, data_end, &iph, &packet);
+    
+    /* check which protocol we are using, based on that parse the header */
+    if (transport_protocol == IPPROTO_TCP) {
+        if (parse_tcp(&curr, data_end, &tcph, &packet) == -1) {
+            return XDP_PASS;
+        }
+    }
+    else if (transport_protocol == IPPROTO_UDP) {
+        if (parse_udp(&curr, data_end, &udph, &packet) == -1) {
+            return XDP_PASS;
+        }
+    }
+    else {
+        return XDP_PASS;
+    }
+    packet.protocol = transport_protocol;
     return XDP_PASS;
 }
 
